@@ -9,4 +9,7 @@ public sealed class SharePointItem
     public long? Size { get; set; }
     public DateTimeOffset? LastModifiedUtc { get; set; }
     public string? ETag { get; set; }
+
+	public string? WebUrl { get; set; }
+	public string? ParentPath { get; set; }
 }
