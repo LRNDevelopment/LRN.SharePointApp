@@ -7,7 +7,7 @@ using System.Text.Json;
 
 namespace LRN.SharePointClient.Graph;
 
-internal sealed class GraphTokenProvider
+public class GraphTokenProvider
 {
     private readonly HttpClient _http;
     private readonly SharePointGraphOptions _opt;

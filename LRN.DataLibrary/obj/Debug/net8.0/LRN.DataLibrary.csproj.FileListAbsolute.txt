@@ -1,0 +1,13 @@
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\bin\Debug\net8.0\LRN.DataLibrary.deps.json
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\bin\Debug\net8.0\LRN.DataLibrary.dll
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\bin\Debug\net8.0\LRN.DataLibrary.pdb
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.csproj.AssemblyReference.cache
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.AssemblyInfoInputs.cache
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.AssemblyInfo.cs
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.csproj.CoreCompileInputs.cache
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.sourcelink.json
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.dll
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\refint\LRN.DataLibrary.dll
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\LRN.DataLibrary.pdb
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.DataLibrary\obj\Debug\net8.0\ref\LRN.DataLibrary.dll

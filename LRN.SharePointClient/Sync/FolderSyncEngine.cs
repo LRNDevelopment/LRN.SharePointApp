@@ -25,89 +25,102 @@ public sealed class FolderSyncEngine
 		Func<string, string, Exception, Task>? onFileUploadFailed,
 		CancellationToken ct)
 	{
-		try
+		if (string.IsNullOrWhiteSpace(localRoot) || !Directory.Exists(localRoot))
+			return 0;
+
+		var search = includeSubfolders ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+		var files = Directory.EnumerateFiles(localRoot, "*.*", search)
+			.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+			.ToList();
+
+		int uploaded = 0;
+
+		foreach (var file in files)
 		{
-			if (string.IsNullOrWhiteSpace(localRoot) || !Directory.Exists(localRoot))
-				return 0;
+			ct.ThrowIfCancellationRequested();
 
-			var search = includeSubfolders ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-			var files = Directory.EnumerateFiles(localRoot, "*.*", search)
-				.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-				.ToList();
+			var rel = Path.GetRelativePath(localRoot, file);
+			var relFolder = (Path.GetDirectoryName(rel) ?? "")
+				.Replace('\\', '/')
+				.Replace('\u202A', ' ')
+				.Replace('\u202B', ' ')
+				.Replace('\u202C', ' ')
+				.Trim('/');
 
-			int uploaded = 0;
-			foreach (var file in files)
+			var spFolder = CombineSpPath(sharePointRootFolder, relFolder);
+
+			var fileName = Path.GetFileName(file);
+			var remotePath = string.IsNullOrWhiteSpace(spFolder) ? fileName : spFolder + "/" + fileName;
+
+			_log.LogInformation(
+				"Upload loop item. LocalFile='{LocalFile}', FileName='{FileName}', SpFolder='{SpFolder}', RemotePath='{RemotePath}', Overwrite={Overwrite}",
+				file, fileName, spFolder, remotePath, overwriteExisting);
+
+			var exists = await _sp.TryGetItemByPathAsync(driveId, remotePath, ct);
+
+			// If file exists, check if local file is newer
+			if (exists != null)
 			{
-				ct.ThrowIfCancellationRequested();
+				var localTime = File.GetLastWriteTimeUtc(file);
+				var remoteTime = exists.LastModifiedDateTime?.ToUniversalTime() ?? DateTime.MinValue;
 
-				var rel = Path.GetRelativePath(localRoot, file);
-				var relFolder = (Path.GetDirectoryName(rel) ?? "")
-					.Replace('\\', '/')
-					.Replace('\u202A', ' ')
-					.Replace('\u202B', ' ')
-					.Replace('\u202C', ' ');
-				relFolder = relFolder.Replace("\\", "/").Trim('/');
-
-				var spFolder = CombineSpPath(sharePointRootFolder, relFolder);
-
-				var fileName = Path.GetFileName(file);
-				var remotePath = string.IsNullOrWhiteSpace(spFolder) ? fileName : spFolder + "/" + fileName;
-
-				_log.LogInformation(
-					"Upload loop item. LocalFile='{LocalFile}', FileName='{FileName}', SpFolder='{SpFolder}', RemotePath='{RemotePath}', Overwrite={Overwrite}",
-					file, fileName, spFolder, remotePath, overwriteExisting);
-
-				var exists = await _sp.TryGetItemByPathAsync(driveId, remotePath, ct);
-
-				if (exists != null && !exists.IsFolder && (exists.Size ?? 0) == 0)
+				if (localTime > remoteTime)
 				{
-					_log.LogWarning(
-						"Existing file is zero bytes, forcing overwrite. RemotePath='{RemotePath}', ItemId='{ItemId}'",
-						remotePath, exists.ItemId);
+					_log.LogInformation(
+						"Local file is newer. Overwriting. Local='{Local}', Remote='{Remote}', LocalTime={LocalTime}, RemoteTime={RemoteTime}",
+						file, remotePath, localTime, remoteTime);
 
-					await _sp.UploadFileAsync(driveId, spFolder, file, fileName, true, ct);
-					uploaded++;
-					continue;
-				}
-
-				if (exists != null && !overwriteExisting)
-				{
-					continue;
-				}
-
-				try
-				{
-					await _sp.UploadFileAsync(driveId, spFolder, file, fileName, overwriteExisting, ct);
-					uploaded++;
-
-
-					var verify = await _sp.TryGetItemByPathAsync(driveId, remotePath, ct);
-					if (verify == null)
+					try
 					{
-						throw new InvalidOperationException($"Upload reported success, but file was not found at '{remotePath}'.");
+						await _sp.UploadFileAsync(driveId, spFolder, file, fileName, true, ct);
+						uploaded++;
+
+						if (onFileUploaded != null)
+							await onFileUploaded(file, remotePath);
+
+						continue;
 					}
+					catch (Exception ex)
+					{
+						_log.LogError(ex, "Upload failed: LocalFile='{LocalFile}' -> RemotePath='{RemotePath}'", file, remotePath);
 
-					_log.LogInformation("Uploaded: LocalFile='{LocalFile}' -> RemotePath='{RemotePath}'", file, remotePath);
+						if (onFileUploadFailed != null)
+							await onFileUploadFailed(file, remotePath, ex);
 
-					if (onFileUploaded != null)
-						await onFileUploaded(file, remotePath);
+						continue;
+					}
 				}
-				catch (Exception ex)
-				{
-					_log.LogError(ex, "Upload failed: LocalFile='{LocalFile}' -> RemotePath='{RemotePath}'", file, remotePath);
 
-					if (onFileUploadFailed != null)
-						await onFileUploadFailed(file, remotePath, ex);
-				}
+				// If file exists and overwriteExisting = false → skip
+				if (!overwriteExisting)
+					continue;
 			}
 
-			return uploaded;
-		}
-		catch (Exception ex)
-		{
-			throw;
+			// Upload new file or overwriteExisting = true
+			try
+			{
+				await _sp.UploadFileAsync(driveId, spFolder, file, fileName, overwriteExisting, ct);
+				uploaded++;
+
+				var verify = await _sp.TryGetItemByPathAsync(driveId, remotePath, ct);
+				if (verify == null)
+					throw new InvalidOperationException($"Upload reported success, but file was not found at '{remotePath}'.");
+
+				_log.LogInformation("Uploaded: LocalFile='{LocalFile}' -> RemotePath='{RemotePath}'", file, remotePath);
+
+				if (onFileUploaded != null)
+					await onFileUploaded(file, remotePath);
+			}
+			catch (Exception ex)
+			{
+				_log.LogError(ex, "Upload failed: LocalFile='{LocalFile}' -> RemotePath='{RemotePath}'", file, remotePath);
+
+				if (onFileUploadFailed != null)
+					await onFileUploadFailed(file, remotePath, ex);
+			}
 		}
 
+		return uploaded;
 	}
 
 	public async Task<int> DownloadMissingAsync(

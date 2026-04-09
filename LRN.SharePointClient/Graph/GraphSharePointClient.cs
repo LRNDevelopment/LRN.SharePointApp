@@ -3,453 +3,519 @@ using LRN.SharePointClient.Models;
 using LRN.SharePointClient.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Graph;
+using Microsoft.Graph.Drives.Item.Items.Item.CreateUploadSession;
+using Microsoft.Graph.Models;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net;
-using System.Net.Http.Headers;
-using System.Text;
-using System.Text.Json;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace LRN.SharePointClient.Graph;
-
-/// <summary>
-/// Microsoft Graph implementation (app-only) for SharePoint document library operations.
-/// </summary>
-public sealed class GraphSharePointClient : ISharePointClient
+namespace LRN.SharePointClient.Graph
 {
-	private readonly HttpClient _http;
-	private readonly SharePointGraphOptions _opt;
-	private readonly ILogger<GraphSharePointClient> _log;
-	private readonly GraphTokenProvider _tokens;
-
-	private string? _cachedSiteId;
-	private string? _cachedDriveId;
-
-	public GraphSharePointClient(HttpClient http, IOptions<SharePointGraphOptions> opt, ILogger<GraphSharePointClient> log)
+	public class GraphSharePointClient : ISharePointClient
 	{
-		_http = http;
-		_opt = opt.Value;
-		_log = log;
-		_tokens = new GraphTokenProvider(http, opt, log);
-	}
+		private readonly GraphServiceClient _graphClient;
+		private readonly HttpClient _httpClient;
+		private readonly ILogger<GraphSharePointClient> _logger;
+		private readonly SharePointGraphOptions _options;
 
-	public async Task<string?> TryResolveDriveIdAsync(CancellationToken ct)
-	{
-		if (!_opt.Enabled) return null;
-		if (!string.IsNullOrWhiteSpace(_cachedDriveId)) return _cachedDriveId;
+		private const int LargeFileThreshold = 4 * 1024 * 1024;
+		private const int ChunkSize = 5 * 1024 * 1024;
 
-		var siteId = await TryResolveSiteIdAsync(ct);
-		if (string.IsNullOrWhiteSpace(siteId)) return null;
-
-		var url = $"https://graph.microsoft.com/v1.0/sites/{siteId}/drives?$select=id,name,driveType,webUrl";
-		using var req = new HttpRequestMessage(HttpMethod.Get, url);
-		await _tokens.AddAuthHeaderAsync(req, ct);
-
-		using var resp = await _http.SendAsync(req, ct);
-		var json = await resp.Content.ReadAsStringAsync(ct);
-
-		if (!resp.IsSuccessStatusCode)
+		public GraphSharePointClient(
+			GraphServiceClient graphClient,
+			HttpClient httpClient,
+			IOptions<SharePointGraphOptions> options,
+			ILogger<GraphSharePointClient> logger)
 		{
-			_log.LogError("Graph drives list failed ({Status}). Response: {Body}",
-				(int)resp.StatusCode, Trunc(json, 800));
-			return null;
+			_graphClient = graphClient ?? throw new ArgumentNullException(nameof(graphClient));
+			_httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+			_options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+			_logger = logger ?? throw new ArgumentNullException(nameof(logger));
 		}
 
-		using var doc = JsonDocument.Parse(json);
-
-		foreach (var d in doc.RootElement.GetProperty("value").EnumerateArray())
+		public async Task<string?> TryResolveDriveIdAsync(CancellationToken ct)
 		{
-			var name = d.TryGetProperty("name", out var n) ? n.GetString() : null;
-			var id = d.TryGetProperty("id", out var i) ? i.GetString() : null;
+			var hostName = string.IsNullOrWhiteSpace(_options.SiteHostName)
+				? _options.Hostname
+				: _options.SiteHostName;
 
-			_log.LogInformation("Available drive: Name='{Name}', Id='{Id}'", name, id);
+			if (string.IsNullOrWhiteSpace(hostName) || string.IsNullOrWhiteSpace(_options.SitePath))
+				return null;
 
-			if (!string.IsNullOrWhiteSpace(id) &&
-				string.Equals(name, _opt.DriveName, StringComparison.OrdinalIgnoreCase))
+			var normalizedSitePath = _options.SitePath.StartsWith("/")
+				? _options.SitePath
+				: "/" + _options.SitePath;
+
+			var siteId = $"{hostName}:{normalizedSitePath}";
+
+			var site = await _graphClient
+				.Sites[siteId]
+				.GetAsync(cancellationToken: ct);
+
+			if (site?.Id == null)
+				return null;
+
+			var drives = await _graphClient
+				.Sites[site.Id]
+				.Drives
+				.GetAsync(cancellationToken: ct);
+
+			var drive = drives?.Value?.FirstOrDefault(d =>
+				string.Equals(d.Name, _options.DriveName, StringComparison.OrdinalIgnoreCase));
+
+			return drive?.Id;
+		}
+
+		public Task EnsureFolderPathAsync(string driveId, string folderPath, CancellationToken ct)
+			=> EnsureFolderHierarchyExistsAsync(driveId, folderPath, ct);
+
+		public async Task<SharePointItem?> TryGetItemByPathAsync(string driveId, string itemPath, CancellationToken ct)
+		{
+			try
 			{
-				_cachedDriveId = id;
-				_log.LogInformation("Resolved drive '{DriveName}' => {DriveId}", name, id);
-				return id;
+				var item = await _graphClient
+					.Drives[driveId]
+					.Root
+					.ItemWithPath(itemPath)
+					.GetAsync(cancellationToken: ct);
+
+				return item == null ? null : MapItem(driveId, item);
+			}
+			catch
+			{
+				return null;
 			}
 		}
 
-		throw new InvalidOperationException(
-			$"Configured SharePoint drive '{_opt.DriveName}' was not found. " +
-			"Do not fall back to the first drive.");
-	}
-	public async Task EnsureFolderPathAsync(string driveId, string folderPath, CancellationToken ct)
-	{
-		var clean = NormalizePath(folderPath);
-		if (string.IsNullOrWhiteSpace(clean)) return;
-
-		// Create missing folders segment-by-segment under drive root.
-		var segs = clean.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-		var current = "";
-
-		foreach (var seg in segs)
+		public async Task<IReadOnlyList<SharePointItem>> ListChildrenAsync(string driveId, string folderPath, CancellationToken ct)
 		{
-			current = string.IsNullOrWhiteSpace(current) ? seg : current + "/" + seg;
-			var exists = await TryGetItemByPathAsync(driveId, current, ct);
-			if (exists != null && exists.IsFolder) continue;
+			DriveItemCollectionResponse? response;
 
-			// Create folder under parent
-			var parent = current.Contains('/') ? current[..current.LastIndexOf('/')].Trim('/') : "";
-			var createUrl = string.IsNullOrWhiteSpace(parent)
-				? $"https://graph.microsoft.com/v1.0/drives/{driveId}/root/children"
-				: $"https://graph.microsoft.com/v1.0/drives/{driveId}/root:/{EncodePath(parent)}:/children";
-
-			var payload = new Dictionary<string, object?>
+			if (string.IsNullOrWhiteSpace(folderPath))
 			{
-				["name"] = seg,
-				["folder"] = new Dictionary<string, object?>(),   // {} in JSON
-				["@microsoft.graph.conflictBehavior"] = "fail"
+				response = await _graphClient
+					.Drives[driveId]
+					.Items["root"]
+					.Children
+					.GetAsync(cancellationToken: ct);
+			}
+			else
+			{
+				response = await _graphClient
+					.Drives[driveId]
+					.Root
+					.ItemWithPath(folderPath)
+					.Children
+					.GetAsync(cancellationToken: ct);
+			}
+
+			return response?.Value?.Select(i => MapItem(driveId, i)).ToList()
+				?? new List<SharePointItem>();
+		}
+
+		public async Task DownloadFileAsync(string driveId, string itemId, string localFilePath, bool overwrite, CancellationToken ct)
+		{
+			if (File.Exists(localFilePath) && !overwrite)
+				return;
+
+			var parent = Path.GetDirectoryName(localFilePath);
+			if (!string.IsNullOrWhiteSpace(parent))
+				Directory.CreateDirectory(parent);
+
+			using var content = await _graphClient
+				.Drives[driveId]
+				.Items[itemId]
+				.Content
+				.GetAsync(cancellationToken: ct);
+
+			if (content == null)
+				throw new InvalidOperationException($"No content returned for item '{itemId}'.");
+
+			await using var target = new FileStream(localFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
+			await content.CopyToAsync(target, ct);
+		}
+
+		public async Task UploadFileAsync(
+			string driveId,
+			string folderPath,
+			string localFilePath,
+			string targetFileName,
+			bool overwrite,
+			CancellationToken ct)
+		{
+			if (string.IsNullOrWhiteSpace(driveId))
+				throw new ArgumentNullException(nameof(driveId));
+			if (string.IsNullOrWhiteSpace(localFilePath))
+				throw new ArgumentNullException(nameof(localFilePath));
+			if (string.IsNullOrWhiteSpace(targetFileName))
+				throw new ArgumentNullException(nameof(targetFileName));
+
+			var fileInfo = new FileInfo(localFilePath);
+			if (!fileInfo.Exists)
+				throw new FileNotFoundException("Local file not found.", localFilePath);
+
+			var remotePath = string.IsNullOrWhiteSpace(folderPath)
+				? targetFileName
+				: $"{folderPath.TrimEnd('/', '\\')}/{targetFileName}";
+
+			_logger.LogInformation(
+				"Uploading file '{LocalFile}' to '{RemotePath}' in drive '{DriveId}'",
+				localFilePath, remotePath, driveId);
+
+			try
+			{
+				await UploadInternalAsync(driveId, remotePath, localFilePath, overwrite, ct);
+			}
+			catch (Exception ex) when (overwrite && IsTooManyMinorVersionsError(ex))
+			{
+				_logger.LogWarning(ex,
+					"Upload blocked by SharePoint minor-version limit for '{RemotePath}'. Deleting existing remote file and retrying as a fresh upload.",
+					remotePath);
+
+				await DeleteRemoteFileIfExistsAsync(driveId, remotePath, ct);
+				await WaitUntilRemoteFileDeletedAsync(driveId, remotePath, ct);
+				await Task.Delay(1000, ct);
+
+				await UploadInternalAsync(driveId, remotePath, localFilePath, overwrite: false, ct);
+			}
+		}
+
+		private static SharePointItem MapItem(string driveId, DriveItem item)
+		{
+			var parentPath = item.ParentReference?.Path;
+			var normalizedParent = parentPath;
+			const string marker = "/root:";
+			var idx = parentPath?.IndexOf(marker, StringComparison.OrdinalIgnoreCase) ?? -1;
+			if (idx >= 0)
+			{
+				normalizedParent = parentPath![..].Substring(idx + marker.Length).Trim('/');
+			}
+
+			return new SharePointItem
+			{
+				DriveId = driveId,
+				ItemId = item.Id ?? string.Empty,
+				Name = item.Name ?? string.Empty,
+				IsFolder = item.Folder != null,
+				Size = item.Size,
+				LastModifiedUtc = item.LastModifiedDateTime,
+				ETag = item.ETag,
+				WebUrl = item.WebUrl,
+				ParentPath = normalizedParent,
+				LastModifiedDateTime = item.LastModifiedDateTime?.UtcDateTime
 			};
+		}
 
-			using var req = new HttpRequestMessage(HttpMethod.Post, createUrl)
+		private async Task UploadInternalAsync(
+			string driveId,
+			string remotePath,
+			string localFilePath,
+			bool overwrite,
+			CancellationToken ct)
+		{
+			var fileInfo = new FileInfo(localFilePath);
+
+			if (fileInfo.Length <= LargeFileThreshold)
 			{
-				Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
-			};
-			await _tokens.AddAuthHeaderAsync(req, ct);
-
-			using var resp = await _http.SendAsync(req, ct);
-			if (resp.IsSuccessStatusCode)
-				continue;
-
-			var body = await resp.Content.ReadAsStringAsync(ct);
-
-			// If conflict, folder already exists -> ok
-			if (resp.StatusCode == HttpStatusCode.Conflict)
-				continue;
-
-			_log.LogError("Failed creating folder '{Folder}'. Status={Status}. Body={Body}", current, (int)resp.StatusCode, Trunc(body, 800));
-			throw new InvalidOperationException($"Failed creating SharePoint folder '{current}'.");
-		}
-	}
-
-	public async Task<SharePointItem?> TryGetItemByPathAsync(string driveId, string itemPath, CancellationToken ct)
-	{
-		var clean = NormalizePath(itemPath);
-		var url = string.IsNullOrWhiteSpace(clean)
-			? $"https://graph.microsoft.com/v1.0/drives/{driveId}/root?$select=id,name,folder,file,eTag,lastModifiedDateTime,size,webUrl,parentReference"
-			: $"https://graph.microsoft.com/v1.0/drives/{driveId}/root:/{EncodePath(clean)}?$select=id,name,folder,file,eTag,lastModifiedDateTime,size,webUrl,parentReference";
-
-		_log.LogInformation("Graph get item by path. DriveId={DriveId}, Path='{Path}', Url='{Url}'", driveId, clean, url);
-
-		using var req = new HttpRequestMessage(HttpMethod.Get, url);
-		await _tokens.AddAuthHeaderAsync(req, ct);
-
-		using var resp = await _http.SendAsync(req, ct);
-		var json = await resp.Content.ReadAsStringAsync(ct);
-
-		if (resp.StatusCode == HttpStatusCode.NotFound)
-		{
-			_log.LogInformation("Remote item NOT FOUND. DriveId={DriveId}, Path='{Path}'", driveId, clean);
-			return null;
-		}
-
-		if (!resp.IsSuccessStatusCode)
-		{
-			_log.LogError(
-				"Graph get item by path failed. Status={Status}, DriveId={DriveId}, Path='{Path}', Url='{Url}', Body={Body}",
-				(int)resp.StatusCode, driveId, clean, url, Trunc(json, 1000));
-
-			throw new InvalidOperationException(
-				$"Graph get item by path failed. Status={(int)resp.StatusCode}, Path='{clean}'.");
-		}
-
-		using var doc = JsonDocument.Parse(json);
-		var item = ToItem(doc.RootElement, driveId);
-
-		_log.LogInformation("Remote item FOUND. DriveId={DriveId}, Path='{Path}', ItemId='{ItemId}', Name='{Name}'",
-			driveId, clean, item.ItemId, item.Name);
-
-		return item;
-	}
-
-	public async Task<IReadOnlyList<SharePointItem>> ListChildrenAsync(string driveId, string folderPath, CancellationToken ct)
-	{
-		var clean = NormalizePath(folderPath);
-		var url = string.IsNullOrWhiteSpace(clean)
-			? $"https://graph.microsoft.com/v1.0/drives/{driveId}/root/children?$select=id,name,folder,file,eTag,lastModifiedDateTime,size"
-			: $"https://graph.microsoft.com/v1.0/drives/{driveId}/root:/{EncodePath(clean)}:/children?$select=id,name,folder,file,eTag,lastModifiedDateTime,size";
-
-		var items = new List<SharePointItem>();
-		while (!string.IsNullOrWhiteSpace(url))
-		{
-			using var req = new HttpRequestMessage(HttpMethod.Get, url);
-			await _tokens.AddAuthHeaderAsync(req, ct);
-			using var resp = await _http.SendAsync(req, ct);
-			var json = await resp.Content.ReadAsStringAsync(ct);
-			if (!resp.IsSuccessStatusCode)
-			{
-				_log.LogWarning("Graph list children failed ({Status}) for '{Folder}'. Body={Body}", (int)resp.StatusCode, clean, Trunc(json, 500));
-				break;
+				await UploadSmallFileAsync(driveId, remotePath, localFilePath, overwrite, ct);
 			}
-
-			using var doc = JsonDocument.Parse(json);
-			foreach (var e in doc.RootElement.GetProperty("value").EnumerateArray())
-				items.Add(ToItem(e, driveId));
-
-			url = doc.RootElement.TryGetProperty("@odata.nextLink", out var next) ? next.GetString() : null;
-		}
-		return items;
-	}
-
-	public async Task UploadFileAsync(string driveId, string folderPath, string localFilePath, string targetFileName, bool overwrite, CancellationToken ct)
-	{
-		if (string.IsNullOrWhiteSpace(localFilePath) || !File.Exists(localFilePath))
-			throw new FileNotFoundException("Local file not found", localFilePath);
-
-		if (string.IsNullOrWhiteSpace(targetFileName))
-			throw new InvalidOperationException("targetFileName must be supplied explicitly for SharePoint upload.");
-
-		var folder = NormalizePath(folderPath);
-		var fileName = targetFileName.Trim();
-		var remotePath = string.IsNullOrWhiteSpace(folder) ? fileName : folder + "/" + fileName;
-
-		_log.LogInformation(
-			"Preparing SharePoint upload. LocalFile='{LocalFile}', TargetFileName='{TargetFileName}', RemotePath='{RemotePath}'",
-			localFilePath, fileName, remotePath);
-
-		if (!string.IsNullOrWhiteSpace(folder))
-			await EnsureFolderPathAsync(driveId, folder, ct);
-
-		var existing = await TryGetItemByPathAsync(driveId, remotePath, ct);
-
-		_log.LogInformation(
-			"Exists check. RemotePath='{RemotePath}', Exists={Exists}, ExistingName='{ExistingName}'",
-			remotePath, existing != null, existing?.Name);
-
-		if (existing != null && !overwrite)
-			return;
-
-		var fi = new FileInfo(localFilePath);
-		if (fi.Length <= 4L * 1024L * 1024L)
-		{
-			var putUrl = $"https://graph.microsoft.com/v1.0/drives/{driveId}/root:/{EncodePath(remotePath)}:/content";
-			using var fs = File.OpenRead(localFilePath);
-			using var req = new HttpRequestMessage(HttpMethod.Put, putUrl)
+			else
 			{
-				Content = new StreamContent(fs)
-			};
-			req.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-			await _tokens.AddAuthHeaderAsync(req, ct);
-
-			using var resp = await _http.SendAsync(req, ct);
-			var body = await resp.Content.ReadAsStringAsync(ct);
-
-			if (!resp.IsSuccessStatusCode)
-				throw new InvalidOperationException($"Simple upload failed for '{remotePath}'. Body={body}");
-
-			return;
-		}
-
-		await UploadLargeFileWithSessionAsync(driveId, remotePath, localFilePath, overwrite, ct);
-	}
-
-	public async Task DownloadFileAsync(string driveId, string itemId, string localFilePath, bool overwrite, CancellationToken ct)
-	{
-		if (File.Exists(localFilePath) && !overwrite)
-			return;
-
-		Directory.CreateDirectory(Path.GetDirectoryName(localFilePath) ?? ".");
-
-		var url = $"https://graph.microsoft.com/v1.0/drives/{driveId}/items/{itemId}/content";
-		using var req = new HttpRequestMessage(HttpMethod.Get, url);
-		await _tokens.AddAuthHeaderAsync(req, ct);
-
-		using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-		if (!resp.IsSuccessStatusCode)
-		{
-			var body = await resp.Content.ReadAsStringAsync(ct);
-			_log.LogError("Graph download failed ({Status}) for item '{Id}'. Body={Body}", (int)resp.StatusCode, itemId, Trunc(body, 800));
-			throw new InvalidOperationException($"Failed downloading item '{itemId}'.");
-		}
-
-		await using var outStream = File.Create(localFilePath);
-		await resp.Content.CopyToAsync(outStream, ct);
-	}
-
-	private async Task<string?> TryResolveSiteIdAsync(CancellationToken ct)
-	{
-		if (!string.IsNullOrWhiteSpace(_cachedSiteId)) return _cachedSiteId;
-
-		var host = !string.IsNullOrWhiteSpace(_opt.SiteHostName) ? _opt.SiteHostName : _opt.Hostname;
-
-		if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(_opt.SitePath))
-		{
-			_log.LogError("SharePoint options missing SiteHostName or SitePath.");
-			return null;
-		}
-
-		// Graph: /sites/{hostname}:/sites/{sitePath}
-		var clean = _opt.SitePath.Trim();
-		if (!clean.StartsWith("/", StringComparison.Ordinal))
-			clean = "/" + clean;
-
-		var url = $"https://graph.microsoft.com/v1.0/sites/{host}:{clean}?$select=id";
-		using var req = new HttpRequestMessage(HttpMethod.Get, url);
-		await _tokens.AddAuthHeaderAsync(req, ct);
-		using var resp = await _http.SendAsync(req, ct);
-		var json = await resp.Content.ReadAsStringAsync(ct);
-		if (!resp.IsSuccessStatusCode)
-		{
-			_log.LogError("Graph site resolve failed ({Status}). Response: {Body}", (int)resp.StatusCode, Trunc(json, 800));
-			return null;
-		}
-
-		using var doc = JsonDocument.Parse(json);
-		_cachedSiteId = doc.RootElement.GetProperty("id").GetString();
-		return _cachedSiteId;
-	}
-
-	private async Task UploadLargeFileWithSessionAsync(string driveId, string remotePath, string localFilePath, bool overwrite, CancellationToken ct)
-	{
-		var createUrl = $"https://graph.microsoft.com/v1.0/drives/{driveId}/root:/{EncodePath(remotePath)}:/createUploadSession";
-		var payload = new
-		{
-			item = new Dictionary<string, object>
-			{
-				["@microsoft.graph.conflictBehavior"] = overwrite ? "replace" : "fail"
+				await UploadLargeFileWithSessionAsync(driveId, remotePath, localFilePath, overwrite, ct);
 			}
-		};
-
-		using var createReq = new HttpRequestMessage(HttpMethod.Post, createUrl)
-		{
-			Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
-		};
-		await _tokens.AddAuthHeaderAsync(createReq, ct);
-
-		using var createResp = await _http.SendAsync(createReq, ct);
-		var createBody = await createResp.Content.ReadAsStringAsync(ct);
-
-		if (!createResp.IsSuccessStatusCode)
-		{
-			_log.LogError("Create upload session failed ({Status}) for '{Path}'. Body={Body}",
-				(int)createResp.StatusCode, remotePath, Trunc(createBody, 800));
-			throw new InvalidOperationException($"Failed creating upload session for '{remotePath}'.");
 		}
 
-		using var createDoc = JsonDocument.Parse(createBody);
-		var uploadUrl = createDoc.RootElement.GetProperty("uploadUrl").GetString();
-		if (string.IsNullOrWhiteSpace(uploadUrl))
-			throw new InvalidOperationException("Upload session did not return uploadUrl.");
-
-		const int chunkSize = 10 * 1024 * 1024;
-		var total = new FileInfo(localFilePath).Length;
-		long offset = 0;
-
-		await using var fs = File.OpenRead(localFilePath);
-		var buffer = new byte[chunkSize];
-
-		while (offset < total)
+		private static bool IsTooManyMinorVersionsError(Exception ex)
 		{
-			ct.ThrowIfCancellationRequested();
+			var text = ex.ToString();
 
-			var toRead = (int)Math.Min(chunkSize, total - offset);
-			var read = await fs.ReadAsync(buffer.AsMemory(0, toRead), ct);
-			if (read <= 0) break;
+			return text.Contains("Document has too many minor versions", StringComparison.OrdinalIgnoreCase)
+				|| (text.Contains("\"code\":\"notAllowed\"", StringComparison.OrdinalIgnoreCase)
+					&& text.Contains("minor versions", StringComparison.OrdinalIgnoreCase));
+		}
 
-			var start = offset;
-			var end = offset + read - 1;
-
-			using var chunkReq = new HttpRequestMessage(HttpMethod.Put, uploadUrl);
-			chunkReq.Content = new ByteArrayContent(buffer, 0, read);
-			chunkReq.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-			chunkReq.Content.Headers.ContentLength = read;
-			chunkReq.Content.Headers.ContentRange = new ContentRangeHeaderValue(start, end, total);
-
-			using var chunkResp = await _http.SendAsync(chunkReq, ct);
-			var body = await chunkResp.Content.ReadAsStringAsync(ct);
-
-			if (chunkResp.StatusCode == HttpStatusCode.Accepted)
+		private async Task DeleteRemoteFileIfExistsAsync(
+			string driveId,
+			string remotePath,
+			CancellationToken ct)
+		{
+			try
 			{
-				_log.LogInformation(
-					"Chunk accepted for '{Path}'. Range=bytes {Start}-{End}/{Total}. Body={Body}",
-					remotePath, start, end, total, Trunc(body, 300));
+				var existingItem = await _graphClient
+					.Drives[driveId]
+					.Root
+					.ItemWithPath(remotePath)
+					.GetAsync(cancellationToken: ct);
 
-				offset += read;
-				continue;
+				if (existingItem?.Id == null)
+					return;
+
+				await _graphClient
+					.Drives[driveId]
+					.Items[existingItem.Id]
+					.DeleteAsync(cancellationToken: ct);
+
+				_logger.LogInformation("Deleted existing remote file '{RemotePath}' before retry upload.", remotePath);
 			}
-
-			if (chunkResp.StatusCode == HttpStatusCode.OK ||
-				chunkResp.StatusCode == HttpStatusCode.Created)
+			catch
 			{
-				string? itemId = null;
-				string? itemName = null;
-				string? webUrl = null;
+				_logger.LogInformation("Remote file '{RemotePath}' was not found during delete retry flow.", remotePath);
+			}
+		}
 
+		private async Task WaitUntilRemoteFileDeletedAsync(
+			string driveId,
+			string remotePath,
+			CancellationToken ct)
+		{
+			for (int i = 0; i < 10; i++)
+			{
 				try
 				{
-					using var finalDoc = JsonDocument.Parse(body);
-					itemId = finalDoc.RootElement.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
-					itemName = finalDoc.RootElement.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : null;
-					webUrl = finalDoc.RootElement.TryGetProperty("webUrl", out var webEl) ? webEl.GetString() : null;
+					var item = await _graphClient
+						.Drives[driveId]
+						.Root
+						.ItemWithPath(remotePath)
+						.GetAsync(cancellationToken: ct);
+
+					if (item == null)
+						return;
 				}
 				catch
 				{
-					// ignore parse issue, still log raw response
+					return;
 				}
 
-				_log.LogInformation(
-					"Large file upload completed. RemotePath='{RemotePath}', ItemId='{ItemId}', ItemName='{ItemName}', WebUrl='{WebUrl}'",
-					remotePath, itemId, itemName, webUrl);
+				await Task.Delay(500, ct);
+			}
+		}
 
-				offset += read;
-				continue;
+		private async Task UploadSmallFileAsync(
+			string driveId,
+			string remotePath,
+			string localFilePath,
+			bool overwrite,
+			CancellationToken ct)
+		{
+			await EnsureFolderHierarchyExistsAsync(
+				driveId,
+				Path.GetDirectoryName(remotePath)?.Replace("\\", "/"),
+				ct);
+
+			await using var fs = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+			var request = _graphClient
+				.Drives[driveId]
+				.Root
+				.ItemWithPath(remotePath)
+				.Content
+				.ToPutRequestInformation(fs);
+
+			await _graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(request, cancellationToken: ct);
+		}
+
+		private async Task UploadLargeFileWithSessionAsync(
+			string driveId,
+			string remotePath,
+			string localFilePath,
+			bool overwrite,
+			CancellationToken ct)
+		{
+			var fileInfo = new FileInfo(localFilePath);
+			var totalSize = fileInfo.Length;
+
+			await EnsureFolderHierarchyExistsAsync(
+				driveId,
+				Path.GetDirectoryName(remotePath)?.Replace("\\", "/"),
+				ct);
+
+			var uploadSession = await CreateUploadSessionInternalAsync(driveId, remotePath, overwrite, ct);
+			var uploadUrl = uploadSession.UploadUrl;
+
+			await using var fs = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+			long offset = 0;
+			int retryCount = 0;
+
+			while (offset < totalSize)
+			{
+				ct.ThrowIfCancellationRequested();
+
+				if (uploadSession.ExpirationDateTime < DateTimeOffset.UtcNow.AddMinutes(2))
+				{
+					_logger.LogWarning(
+						"Upload session for '{RemotePath}' is near expiration. Recreating session and restarting upload.",
+						remotePath);
+
+					uploadSession = await CreateUploadSessionInternalAsync(driveId, remotePath, overwrite, ct);
+					uploadUrl = uploadSession.UploadUrl;
+					offset = 0;
+					fs.Seek(0, SeekOrigin.Begin);
+				}
+
+				var remaining = totalSize - offset;
+				var bytesToRead = (int)Math.Min(ChunkSize, remaining);
+				var buffer = new byte[bytesToRead];
+
+				var read = await fs.ReadAsync(buffer.AsMemory(0, bytesToRead), ct);
+				if (read == 0)
+					break;
+
+				var start = offset;
+				var end = offset + read - 1;
+
+				using var request = new HttpRequestMessage(HttpMethod.Put, uploadUrl)
+				{
+					Content = new ByteArrayContent(buffer, 0, read)
+				};
+
+				request.Content.Headers.TryAddWithoutValidation("Content-Range", $"bytes {start}-{end}/{totalSize}");
+
+				try
+				{
+					using var response = await _httpClient.SendAsync(
+						request,
+						HttpCompletionOption.ResponseContentRead,
+						ct);
+
+					if (response.StatusCode == HttpStatusCode.Created ||
+						response.StatusCode == HttpStatusCode.OK)
+					{
+						_logger.LogInformation("Completed upload of '{RemotePath}'", remotePath);
+						return;
+					}
+
+					if (response.StatusCode == HttpStatusCode.Accepted)
+					{
+						offset = end + 1;
+						retryCount = 0;
+						continue;
+					}
+
+					var body = await response.Content.ReadAsStringAsync(ct);
+					throw new InvalidOperationException($"Upload failed: {response.StatusCode} - {body}");
+				}
+				catch (Exception ex)
+				{
+					retryCount++;
+
+					if (retryCount > 3)
+					{
+						_logger.LogError(ex, "Failed uploading '{RemotePath}' after retries.", remotePath);
+						throw new InvalidOperationException($"Failed uploading '{remotePath}' after retries.", ex);
+					}
+
+					_logger.LogWarning(
+						ex,
+						"Error uploading chunk for '{RemotePath}'. Retrying (attempt {Retry})",
+						remotePath,
+						retryCount);
+
+					await Task.Delay(1500, ct);
+					fs.Seek(offset, SeekOrigin.Begin);
+				}
 			}
 
-			_log.LogError(
-				"Chunk upload failed ({Status}) for '{Path}'. Content-Range=bytes {Start}-{End}/{Total}. Body={Body}",
-				(int)chunkResp.StatusCode, remotePath, start, end, total, Trunc(body, 800));
-
-			throw new InvalidOperationException($"Failed uploading '{remotePath}'.");
-		}
-	}
-
-	private static SharePointItem ToItem(JsonElement e, string driveId)
-	{
-		var item = new SharePointItem
-		{
-			DriveId = driveId,
-			ItemId = e.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
-			Name = e.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "",
-			IsFolder = e.TryGetProperty("folder", out _),
-			ETag = e.TryGetProperty("eTag", out var et) ? et.GetString() : null,
-			Size = e.TryGetProperty("size", out var s) && s.TryGetInt64(out var sz) ? sz : null,
-			WebUrl = e.TryGetProperty("webUrl", out var wu) ? wu.GetString() : null,
-			ParentPath = e.TryGetProperty("parentReference", out var pr) && pr.TryGetProperty("path", out var pp)
-				? pp.GetString()
-				: null
-		};
-
-		if (e.TryGetProperty("lastModifiedDateTime", out var lm) && lm.ValueKind == JsonValueKind.String)
-		{
-			if (DateTimeOffset.TryParse(lm.GetString(), out var dto))
-				item.LastModifiedUtc = dto.ToUniversalTime();
+			throw new InvalidOperationException($"Failed uploading '{remotePath}'. Upload loop exited unexpectedly.");
 		}
 
-		return item;
-	}
+		private async Task EnsureFolderHierarchyExistsAsync(
+			string driveId,
+			string? folderPath,
+			CancellationToken ct)
+		{
+			if (string.IsNullOrWhiteSpace(folderPath))
+				return;
 
-	private static string NormalizePath(string path)
-	{
-		var p = (path ?? "").Replace("\\", "/").Trim().Trim('/');
-		while (p.Contains("//", StringComparison.Ordinal))
-			p = p.Replace("//", "/", StringComparison.Ordinal);
-		return p;
-	}
+			var segments = folderPath
+				.Replace("\\", "/")
+				.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
 
-	private static string EncodePath(string path)
-	{
-		// Graph path segment encoding: encode each segment but keep slashes.
-		var segs = NormalizePath(path)
-			.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-			.Select(Uri.EscapeDataString);
-		return string.Join("/", segs);
-	}
+			var currentPath = string.Empty;
 
-	private static string Trunc(string? s, int max)
-	{
-		if (string.IsNullOrEmpty(s)) return "";
-		return s.Length <= max ? s : s[..max] + "...";
+			foreach (var segment in segments)
+			{
+				currentPath = string.IsNullOrEmpty(currentPath)
+					? segment
+					: $"{currentPath}/{segment}";
+
+				try
+				{
+					_ = await _graphClient
+						.Drives[driveId]
+						.Root
+						.ItemWithPath(currentPath)
+						.GetAsync(cancellationToken: ct);
+				}
+				catch
+				{
+					var parentPath = Path.GetDirectoryName(currentPath)?.Replace("\\", "/") ?? string.Empty;
+
+					var folder = new DriveItem
+					{
+						Name = segment,
+						Folder = new Folder(),
+						AdditionalData = new Dictionary<string, object>
+						{
+							{ "@microsoft.graph.conflictBehavior", "replace" }
+						}
+					};
+
+					if (string.IsNullOrWhiteSpace(parentPath))
+					{
+						await _graphClient
+							.Drives[driveId]
+							.Items["root"]
+							.Children
+							.PostAsync(folder, cancellationToken: ct);
+					}
+					else
+					{
+						await _graphClient
+							.Drives[driveId]
+							.Root
+							.ItemWithPath(parentPath)
+							.Children
+							.PostAsync(folder, cancellationToken: ct);
+					}
+				}
+			}
+		}
+
+		private async Task<UploadSession> CreateUploadSessionInternalAsync(
+			string driveId,
+			string remotePath,
+			bool overwrite,
+			CancellationToken ct)
+		{
+			var body = new CreateUploadSessionPostRequestBody
+			{
+				Item = new DriveItemUploadableProperties
+				{
+					AdditionalData = new Dictionary<string, object>
+					{
+						{ "@microsoft.graph.conflictBehavior", overwrite ? "replace" : "fail" }
+					}
+				}
+			};
+
+			var session = await _graphClient
+				.Drives[driveId]
+				.Root
+				.ItemWithPath(remotePath)
+				.CreateUploadSession
+				.PostAsync(body, cancellationToken: ct);
+
+			if (session == null || string.IsNullOrWhiteSpace(session.UploadUrl))
+				throw new InvalidOperationException($"Failed to create upload session for '{remotePath}'.");
+
+			return session;
+		}
 	}
 }
