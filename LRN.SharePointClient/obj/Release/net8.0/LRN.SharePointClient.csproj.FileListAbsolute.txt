@@ -1,0 +1,13 @@
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\bin\Release\net8.0\LRN.SharePointClient.deps.json
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\bin\Release\net8.0\LRN.SharePointClient.dll
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\bin\Release\net8.0\LRN.SharePointClient.pdb
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.csproj.AssemblyReference.cache
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.AssemblyInfoInputs.cache
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.AssemblyInfo.cs
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.csproj.CoreCompileInputs.cache
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.sourcelink.json
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.dll
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\refint\LRN.SharePointClient.dll
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\LRN.SharePointClient.pdb
+C:\Users\abdul\source\repos\LRNDevelopment\LRN.SharePointApp\LRN.SharePointClient\obj\Release\net8.0\ref\LRN.SharePointClient.dll

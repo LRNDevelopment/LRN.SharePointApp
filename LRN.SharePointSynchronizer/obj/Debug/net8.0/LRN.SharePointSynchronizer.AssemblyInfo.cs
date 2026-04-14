@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("LRN.SharePointSynchronizer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4266e2e857d2c71d304aeb08137d65798ae03702")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+4886c6be0bdd4bdeb780a96a86d6a1b37ac7f073")]
 [assembly: System.Reflection.AssemblyProductAttribute("LRN.SharePointSynchronizer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("LRN.SharePointSynchronizer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
