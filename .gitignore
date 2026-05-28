@@ -1,2 +1,12 @@
-.vs/ 
-.vs/ 
+.vs/
+
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio user-specific files
+*.user
+*.rsuser
+
+# Publish profile user settings
+[Pp]roperties/[Pp]ublishProfiles/*.pubxml.user
