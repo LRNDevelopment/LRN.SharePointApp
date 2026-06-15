@@ -6,6 +6,7 @@ using Microsoft.Extensions.Options;
 using Microsoft.Graph;
 using Microsoft.Graph.Drives.Item.Items.Item.CreateUploadSession;
 using Microsoft.Graph.Models;
+using Microsoft.Kiota.Abstractions;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -317,7 +318,37 @@ namespace LRN.SharePointClient.Graph
 				.Content
 				.ToPutRequestInformation(fs);
 
-			await _graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(request, cancellationToken: ct);
+			try
+			{
+				await _graphClient.RequestAdapter.SendPrimitiveAsync<Stream>(request, cancellationToken: ct);
+			}
+			catch (ApiException ex) when (overwrite && ex.ResponseStatusCode == (int)HttpStatusCode.Forbidden)
+			{
+				_logger.LogWarning(
+					ex,
+					"Small-file direct upload was forbidden for '{RemotePath}'. Retrying through an upload session.",
+					remotePath);
+
+				await UploadLargeFileWithSessionAsync(driveId, remotePath, localFilePath, overwrite, ct);
+			}
+			catch (ApiException ex) when (ex.ResponseStatusCode == (int)HttpStatusCode.Forbidden)
+			{
+				throw CreateForbiddenUploadException(remotePath, overwrite, ex);
+			}
+		}
+
+		private static InvalidOperationException CreateForbiddenUploadException(
+			string remotePath,
+			bool overwrite,
+			ApiException ex)
+		{
+			var overwriteHint = overwrite
+				? "The upload was allowed to overwrite, so check SharePoint file/folder permissions, checkout/lock status, retention or sensitivity policies, and whether the app registration has write access to this library."
+				: "The upload was not allowed to overwrite. If the file already exists, enable overwrite or skip the file.";
+
+			return new InvalidOperationException(
+				$"SharePoint rejected upload to '{remotePath}' with HTTP 403 Forbidden. {overwriteHint}",
+				ex);
 		}
 
 		private async Task UploadLargeFileWithSessionAsync(
@@ -505,12 +536,20 @@ namespace LRN.SharePointClient.Graph
 				}
 			};
 
-			var session = await _graphClient
-				.Drives[driveId]
-				.Root
-				.ItemWithPath(remotePath)
-				.CreateUploadSession
-				.PostAsync(body, cancellationToken: ct);
+			UploadSession? session;
+			try
+			{
+				session = await _graphClient
+					.Drives[driveId]
+					.Root
+					.ItemWithPath(remotePath)
+					.CreateUploadSession
+					.PostAsync(body, cancellationToken: ct);
+			}
+			catch (ApiException ex) when (ex.ResponseStatusCode == (int)HttpStatusCode.Forbidden)
+			{
+				throw CreateForbiddenUploadException(remotePath, overwrite, ex);
+			}
 
 			if (session == null || string.IsNullOrWhiteSpace(session.UploadUrl))
 				throw new InvalidOperationException($"Failed to create upload session for '{remotePath}'.");
