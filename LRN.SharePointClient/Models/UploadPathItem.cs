@@ -27,4 +27,13 @@ public sealed class UploadPathItem
 
     /// <summary>Overwrite existing files when syncing.</summary>
     public bool OverwriteExisting { get; set; } = false;
+
+    /// <summary>For raw reports, resolve and synchronize only the latest year/month/week folder.</summary>
+    public bool SyncLatestWeekRawOnly { get; set; } = false;
+
+    /// <summary>Optional folder name inside the latest week folder to synchronize.</summary>
+    public string RawFolderName { get; set; } = "";
+
+    /// <summary>Optional file name pattern reserved for raw file sync rules.</summary>
+    public string FileNamePattern { get; set; } = "";
 }
