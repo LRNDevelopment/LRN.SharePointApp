@@ -130,7 +130,8 @@ public sealed class FolderSyncEngine
 		bool overwriteExisting,
 		Func<string, string, Task>? onFileDownloaded,
 		Func<string, string, Exception, Task>? onFileDownloadFailed,
-		CancellationToken ct)
+		Func<string, bool>? fileNameFilter = null,
+		CancellationToken ct = default)
 	{
 		Directory.CreateDirectory(localRoot);
 		return await DownloadFolderRecursiveAsync(
@@ -140,6 +141,7 @@ public sealed class FolderSyncEngine
 			overwriteExisting,
 			onFileDownloaded,
 			onFileDownloadFailed,
+			fileNameFilter,
 			ct);
 	}
 
@@ -150,6 +152,7 @@ public sealed class FolderSyncEngine
 		bool overwrite,
 		Func<string, string, Task>? onFileDownloaded,
 		Func<string, string, Exception, Task>? onFileDownloadFailed,
+		Func<string, bool>? fileNameFilter,
 		CancellationToken ct)
 	{
 		ct.ThrowIfCancellationRequested();
@@ -173,9 +176,13 @@ public sealed class FolderSyncEngine
 					overwrite,
 					onFileDownloaded,
 					onFileDownloadFailed,
+					fileNameFilter,
 					ct);
 				continue;
 			}
+
+			if (fileNameFilter != null && !fileNameFilter(item.Name))
+				continue;
 
 			var localPath = Path.Combine(localFolder, item.Name);
 			if (File.Exists(localPath) && !overwrite)

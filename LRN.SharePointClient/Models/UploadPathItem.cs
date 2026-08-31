@@ -48,14 +48,15 @@ public sealed class UploadPathItem
 
     /// <summary>
     /// When true, the synchronizer does not download the whole SharePoint tree.
-    /// It finds the latest Year / Month / Week folder, then downloads files from the raw-file folder only.
-    /// Also enabled automatically when SyncronizeFileType contains Raw.
+    /// It finds the latest Year / Month / Week folder, then downloads every raw-file folder
+    /// under that week (there can be more than one) into
+    /// ServerOutputFolder\Year\Month\Week\RawFolderName, mirroring the SharePoint names.
     /// </summary>
     public bool SyncLatestWeekRawOnly { get; set; } = false;
 
     /// <summary>
-    /// Optional raw folder name under the latest week folder.
-    /// Example: Certus Master Raw Data. If empty, the worker auto-detects a folder containing Raw.
+    /// Optional raw folder name filter under the latest week folder.
+    /// Example: Certus Master Raw Data. If empty, the worker auto-detects all folders containing Raw.
     /// </summary>
     public string? RawFolderName { get; set; }
 }

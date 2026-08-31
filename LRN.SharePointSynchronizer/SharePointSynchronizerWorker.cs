@@ -189,54 +189,36 @@ public sealed class SharePointSynchronizerWorker : BackgroundService
         }
 
         var weekSpFolder = CombineSpPath(monthSpFolder, weekFolder.Name);
-        var rawSpFolder = await ResolveRawFolderAsync(driveId, weekSpFolder, rawFolderName, ct);
-        if (string.IsNullOrWhiteSpace(rawSpFolder))
+        var rawFolders = await ResolveRawFoldersAsync(driveId, weekSpFolder, rawFolderName, ct);
+        if (rawFolders.Count == 0)
         {
             _log.LogWarning("[{Type}] No raw folder found under {WeekFolder}.", item.SyncronizeFileType, weekSpFolder);
             return 0;
         }
 
-        var localRawFolder = Path.Combine(item.ServerOutputFolder, yearFolder.Name, monthFolder.Name, weekFolder.Name, "RawFile");
-        Directory.CreateDirectory(localRawFolder);
-
-        var files = (await _sp.ListChildrenAsync(driveId, rawSpFolder, ct))
-            .Where(x => !x.IsFolder)
-            .Where(x => FileNameMatches(x.Name, item.FileNamePattern))
-            .OrderByDescending(x => x.LastModifiedUtc ?? DateTimeOffset.MinValue)
-            .ThenBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        if (files.Count == 0)
-        {
-            _log.LogWarning("[{Type}] No matching raw files found in {RawFolder}. Pattern='{Pattern}'", item.SyncronizeFileType, rawSpFolder, item.FileNamePattern ?? "*");
-            return 0;
-        }
+        var localYearFolder = ResolveExistingLocalFolder(item.ServerOutputFolder, yearFolder.Name, YearFolderMatches);
+        var localMonthFolder = ResolveExistingLocalFolder(localYearFolder, monthFolder.Name, MonthFolderMatches);
+        var localWeekFolder = ResolveExistingLocalFolder(localMonthFolder, weekFolder.Name, WeekFolderMatches);
 
         var downloaded = 0;
-        foreach (var file in files)
+        foreach (var rawFolder in rawFolders)
         {
             ct.ThrowIfCancellationRequested();
-            var localPath = Path.Combine(localRawFolder, file.Name);
-            var remotePath = CombineSpPath(rawSpFolder, file.Name);
 
-            if (File.Exists(localPath) && !item.OverwriteExisting)
-            {
-                _log.LogInformation("[{Type}] Raw file already exists; skipped. {LocalPath}", item.SyncronizeFileType, localPath);
-                continue;
-            }
+            var rawSpFolder = CombineSpPath(weekSpFolder, rawFolder.Name);
+            var localRawFolder = ResolveExistingLocalFolder(localWeekFolder, rawFolder.Name, NormalizedNameEquals);
 
-            try
-            {
-                await _sp.DownloadFileAsync(driveId, file.ItemId, localPath, item.OverwriteExisting, ct);
-                downloaded++;
-                _log.LogInformation("[{Type}] Downloaded raw file: {RemotePath} -> {LocalPath}", item.SyncronizeFileType, remotePath, localPath);
-                await NotifyFileSynchronizedAsync(item.SyncronizeFileType, remotePath, localPath, ct);
-            }
-            catch (Exception ex)
-            {
-                _log.LogError(ex, "[{Type}] Raw file download failed: {RemotePath} -> {LocalPath}", item.SyncronizeFileType, remotePath, localPath);
-                await NotifyFileSyncFailedAsync(item.SyncronizeFileType, remotePath, localPath, ex, ct);
-            }
+            _log.LogInformation("[{Type}] Syncing raw folder: {SP} -> {Local}", item.SyncronizeFileType, rawSpFolder, localRawFolder);
+
+            downloaded += await _sync.DownloadMissingAsync(
+                driveId,
+                rawSpFolder,
+                localRawFolder,
+                overwriteExisting: item.OverwriteExisting,
+                onFileDownloaded: (remotePath, localPath) => NotifyFileSynchronizedAsync(item.SyncronizeFileType, remotePath, localPath, ct),
+                onFileDownloadFailed: (remotePath, localPath, ex) => NotifyFileSyncFailedAsync(item.SyncronizeFileType, remotePath, localPath, ex, ct),
+                fileNameFilter: name => FileNameMatches(name, item.FileNamePattern),
+                ct: ct);
         }
 
         return downloaded;
@@ -289,12 +271,61 @@ public sealed class SharePointSynchronizerWorker : BackgroundService
         if (string.IsNullOrWhiteSpace(datedPath))
             return item.ServerOutputFolder;
 
-        var localParts = new[] { item.ServerOutputFolder }
-            .Concat(datedPath.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            .ToArray();
+        var parts = datedPath.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var current = item.ServerOutputFolder;
+        for (var i = 0; i < parts.Length; i++)
+        {
+            Func<string, string, bool> matches = i switch
+            {
+                0 => YearFolderMatches,
+                1 => MonthFolderMatches,
+                2 => WeekFolderMatches,
+                _ => NormalizedNameEquals
+            };
+            current = ResolveExistingLocalFolder(current, parts[i], matches);
+        }
 
-        return Path.Combine(localParts);
+        return current;
     }
+
+    /// <summary>
+    /// Reuses an existing local subfolder that matches the SharePoint folder name
+    /// (ignoring whitespace/format differences like "07.July" vs "07. July");
+    /// only falls back to the SharePoint name when no local match exists.
+    /// When several local folders match, the oldest one wins.
+    /// </summary>
+    private static string ResolveExistingLocalFolder(string parentFolder, string spName, Func<string, string, bool> matches)
+    {
+        if (!Directory.Exists(parentFolder))
+            return Path.Combine(parentFolder, spName);
+
+        var match = Directory.EnumerateDirectories(parentFolder)
+            .Select(p => new DirectoryInfo(p))
+            .Where(d => matches(d.Name, spName))
+            .OrderBy(d => d.CreationTimeUtc)
+            .ThenBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+
+        return match?.FullName ?? Path.Combine(parentFolder, spName);
+    }
+
+    private static bool YearFolderMatches(string localName, string spName)
+        => NormalizedNameEquals(localName, spName)
+           || (TryGetYear(localName) is int local && TryGetYear(spName) is int sp && local == sp);
+
+    private static bool MonthFolderMatches(string localName, string spName)
+        => NormalizedNameEquals(localName, spName)
+           || (TryGetMonthNumber(localName) is int local && TryGetMonthNumber(spName) is int sp && local == sp);
+
+    private static bool WeekFolderMatches(string localName, string spName)
+        => NormalizedNameEquals(localName, spName)
+           || (TryGetWeekEndDate(localName) is DateTime local && TryGetWeekEndDate(spName) is DateTime sp && local == sp);
+
+    private static bool NormalizedNameEquals(string localName, string spName)
+        => string.Equals(
+            Regex.Replace(localName, @"\s+", ""),
+            Regex.Replace(spName, @"\s+", ""),
+            StringComparison.OrdinalIgnoreCase);
 
     private static string? GetDatedRelativeFolderPath(string spFolder)
     {
@@ -348,24 +379,24 @@ public sealed class SharePointSynchronizerWorker : BackgroundService
         return folders.FirstOrDefault()?.Item;
     }
 
-    private async Task<string?> ResolveRawFolderAsync(string driveId, string weekSpFolder, string? rawFolderName, CancellationToken ct)
+    private async Task<IReadOnlyList<SharePointItem>> ResolveRawFoldersAsync(string driveId, string weekSpFolder, string? rawFolderName, CancellationToken ct)
     {
         var children = await _sp.ListChildrenAsync(driveId, weekSpFolder, ct);
-        var folders = children.Where(x => x.IsFolder).ToList();
+        var folders = children
+            .Where(x => x.IsFolder)
+            .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         if (!string.IsNullOrWhiteSpace(rawFolderName))
         {
-            var exact = folders.FirstOrDefault(x => string.Equals(x.Name, rawFolderName, StringComparison.OrdinalIgnoreCase));
-            if (exact != null)
-                return CombineSpPath(weekSpFolder, exact.Name);
-
-            var contains = folders.FirstOrDefault(x => x.Name.Contains(rawFolderName, StringComparison.OrdinalIgnoreCase) || rawFolderName.Contains(x.Name, StringComparison.OrdinalIgnoreCase));
-            if (contains != null)
-                return CombineSpPath(weekSpFolder, contains.Name);
+            var named = folders
+                .Where(x => x.Name.Contains(rawFolderName, StringComparison.OrdinalIgnoreCase) || rawFolderName.Contains(x.Name, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (named.Count > 0)
+                return named;
         }
 
-        var raw = folders.FirstOrDefault(x => x.Name.Contains("Raw", StringComparison.OrdinalIgnoreCase));
-        return raw == null ? null : CombineSpPath(weekSpFolder, raw.Name);
+        return folders.Where(x => x.Name.Contains("Raw", StringComparison.OrdinalIgnoreCase)).ToList();
     }
 
     private static int? TryGetYear(string name)
